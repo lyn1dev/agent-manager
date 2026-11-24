@@ -54,6 +54,9 @@ type Runner struct {
 	// captureErr holds a background id-capture failure to surface on the
 	// next poll, since that work no longer runs inline.
 	captureErr error
+	// held are the panes a lifecycle action is ending or relaunching, which
+	// the poll leaves alone until the action is done.
+	held map[string]bool
 
 	// captureBusy guards the single in-flight id-capture goroutine.
 	captureBusy atomic.Bool
@@ -296,6 +299,7 @@ func (p *Runner) step(ctx context.Context) Result {
 	selectedID := p.selectedID
 	captureErr := p.captureErr
 	p.captureErr = nil
+	held := maps.Clone(p.held)
 	p.mu.Unlock()
 	if captureErr != nil {
 		return Result{Err: captureErr}
@@ -376,7 +380,7 @@ func (p *Runner) step(ctx context.Context) Result {
 	followFailures := make(map[string]error, len(sessions))
 	var turnsEnded []string
 	for i, sess := range sessions {
-		if sess.Archived {
+		if sess.Archived || held[sess.ID] {
 			continue
 		}
 		// A session belongs to the tmux server its pane runs on. Panes on
@@ -742,6 +746,40 @@ func (p *Runner) ReflowSessions(ids []string, reflow func()) error {
 		delete(p.quietSince, id)
 	}
 	reflow()
+	return nil
+}
+
+// HoldSessions runs a lifecycle action on ids while the poll carries on
+// with every other pane. It waits out a pass in flight, so no status read
+// before the action lands after it, then keeps later passes off the held
+// panes until work returns.
+func (p *Runner) HoldSessions(ids []string, work func()) error {
+	p.runMu.Lock()
+	if p.stopped {
+		p.runMu.Unlock()
+		return errors.New("execution runner stopped before UI effect")
+	}
+	for _, id := range ids {
+		delete(p.paneHashes, id)
+		delete(p.quietSince, id)
+	}
+	p.mu.Lock()
+	if p.held == nil {
+		p.held = map[string]bool{}
+	}
+	for _, id := range ids {
+		p.held[id] = true
+	}
+	p.mu.Unlock()
+	p.runMu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		for _, id := range ids {
+			delete(p.held, id)
+		}
+		p.mu.Unlock()
+	}()
+	work()
 	return nil
 }
 

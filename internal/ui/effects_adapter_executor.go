@@ -211,14 +211,6 @@ func (m *Model) captureServices() effectServices {
 	return services
 }
 
-func (s effectServices) reflow(ids []string, work func()) error {
-	if s.runner == nil {
-		work()
-		return nil
-	}
-	return s.runner.ReflowSessions(ids, work)
-}
-
 // focusRuntime is the store, tmux server, watcher, engine and paste transport
 // the focus effects run against.
 func (s effectServices) focusRuntime() focusruntime.Services {

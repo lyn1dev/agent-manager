@@ -40,6 +40,9 @@ type Session struct {
 	// ends; AfterTurnGlyph is root's mark for it.
 	AfterTurn      string
 	AfterTurnGlyph string
+	// Pending is the action this manager has queued on the row, worded as
+	// it is happening ("archiving"), until the action completes.
+	Pending string
 }
 
 // Snapshot is an immutable-by-convention inventory copied at the root

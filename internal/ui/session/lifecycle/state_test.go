@@ -96,3 +96,22 @@ func TestDeletedGroupLeavesTheListing(t *testing.T) {
 		t.Fatal("deleted group kept its base")
 	}
 }
+
+// A queued action marks every row it targets until its run completes.
+func TestPendingCoversTheTargetUntilCleared(t *testing.T) {
+	t.Parallel()
+	state := State{}
+	target := Target{Action: Archive, Sessions: []store.Session{session("a"), session("b")}}
+	state.MarkPending(target)
+
+	if got := PendingWord(state.Pending["b"]); got != "archiving" {
+		t.Fatalf("pending word = %q, want archiving", got)
+	}
+	if !state.AnyPending([]store.Session{session("c"), session("a")}) {
+		t.Fatal("a set holding a pending row must read as pending")
+	}
+	state.ClearPending(target)
+	if state.AnyPending(target.Sessions) {
+		t.Fatalf("cleared target still pending: %v", state.Pending)
+	}
+}

@@ -122,6 +122,7 @@ func (m *Model) applyAfterTurn(request uilifecycle.AfterTurnRequest, result uili
 // did: the statuses that changed, the rows that left or came back, the panes
 // this run launched, and what the completion reports.
 func (m *Model) applyLifecycleEffect(request uilifecycle.Request, result uilifecycle.Result, err error) tea.Cmd {
+	m.ledger.lifecycle.ClearPending(request.Target)
 	change := uilifecycle.Changes(request, result, err)
 	for _, each := range change.Statuses {
 		m.setSessionStatus(each.ID, each.Status)
@@ -350,7 +351,7 @@ func (m *Model) selectedLifecycleRow() (sessiondialogs.Row, bool) {
 // runSessionIntent executes what a session key decided: the card it opens, the
 // batch it queues, or the line it reports.
 func (m *Model) runSessionIntent(intent sessiondialogs.Intent) (tea.Model, tea.Cmd) {
-	if intent.Nothing() {
+	if intent.Nothing() || m.ledger.lifecycle.AnyPending(intent.Card.Target.Sessions) {
 		return m, nil
 	}
 	if intent.Notice != "" {
@@ -361,8 +362,7 @@ func (m *Model) runSessionIntent(intent sessiondialogs.Intent) (tea.Model, tea.C
 		m.clearErr()
 	}
 	if intent.Run {
-		m.queueLifecycle(intent.Card.Target, intent.AllowLive, intent.EmptyNotice)
-		return m, m.nextEffectCmd()
+		return m, tea.Batch(m.queueLifecycle(intent.Card.Target, intent.AllowLive, intent.EmptyNotice), m.nextEffectCmd())
 	}
 	m.openConfirm(cardTarget(intent.Card))
 	return m, nil
@@ -377,11 +377,15 @@ func cardTarget(card sessiondialogs.Card) confirmTarget {
 	}
 }
 
-// queueLifecycle queues a lifecycle request on a copy of its rows.
-func (m *Model) queueLifecycle(target uilifecycle.Target, allowLive bool, emptyNotice string) {
+// queueLifecycle queues a lifecycle request on a copy of its rows and shows
+// it on them until it completes.
+func (m *Model) queueLifecycle(target uilifecycle.Target, allowLive bool, emptyNotice string) tea.Cmd {
 	target.Sessions = append([]store.Session(nil), target.Sessions...)
 	w, h := m.paneTargetSize()
 	m.enqueueEffect(uilifecycle.Request{Target: target, Pane: sessioncmd.PaneSize{Width: w, Height: h}, Watched: m.focus.runtime.Watching(), AllowLive: allowLive, EmptyNotice: emptyNotice}, 0, false)
+	m.ledger.lifecycle.MarkPending(target)
+	m.rebuildRows()
+	return m.startStartupTick()
 }
 
 // lifecycleServices is the effect services as a lifecycle run reaches them.
@@ -390,7 +394,7 @@ func (s effectServices) lifecycleServices() uilifecycle.Services {
 		Lifecycle: s.lifecycle,
 		Store:     s.store,
 		Driver:    s.driver,
-		Reflow:    s.reflowSessions,
+		Hold:      s.holdSessions,
 	}
 	// A nil watcher stored in the interface would read as present.
 	if s.watch != nil {
@@ -399,9 +403,13 @@ func (s effectServices) lifecycleServices() uilifecycle.Services {
 	return services
 }
 
-// reflowSessions holds the panes a lifecycle run touches, the lane contract
-// that keeps an input job from writing into a session it is killing.
-func (s effectServices) reflowSessions(ids []string, work func()) error { return s.reflow(ids, work) }
+func (s effectServices) holdSessions(ids []string, work func()) error {
+	if s.runner == nil {
+		work()
+		return nil
+	}
+	return s.runner.HoldSessions(ids, work)
+}
 
 func (m *Model) attachSelected() (tea.Model, tea.Cmd) {
 	sess, ok := m.selected()

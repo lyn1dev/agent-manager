@@ -17,6 +17,7 @@ import (
 	uiframe "github.com/YoanWai/agent-manager/internal/ui/frame"
 	uirail "github.com/YoanWai/agent-manager/internal/ui/rail"
 	uirailpersist "github.com/YoanWai/agent-manager/internal/ui/rail/persist"
+	uilifecycle "github.com/YoanWai/agent-manager/internal/ui/session/lifecycle"
 	uitheme "github.com/YoanWai/agent-manager/internal/ui/theme"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -85,6 +86,7 @@ func (m *Model) railSnapshot() uirail.Snapshot {
 			Elsewhere:      m.elsewhereNote(session) != "",
 			AfterTurn:      session.AfterTurn,
 			AfterTurnGlyph: m.afterTurnGlyph(session.AfterTurn),
+			Pending:        uilifecycle.PendingWord(m.ledger.lifecycle.Pending[session.ID]),
 		})
 	}
 	return snapshot

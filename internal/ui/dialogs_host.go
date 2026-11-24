@@ -140,7 +140,7 @@ func (m *Model) runConfirmed(target confirmTarget) tea.Cmd {
 	case target.connection != "":
 		m.removeConnection(target.connection)
 	default:
-		m.queueLifecycle(target.lifecycle, false, "")
+		return tea.Batch(m.queueLifecycle(target.lifecycle, false, ""), m.nextEffectCmd())
 	}
 	return m.nextEffectCmd()
 }

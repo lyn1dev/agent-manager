@@ -92,9 +92,9 @@ type Services struct {
 	Store     *store.Store
 	Driver    *tmux.Driver
 	Watch     Watcher
-	// Reflow holds the panes a run touches so no input job writes into a
-	// session it is about to kill or relaunch; nil runs the work directly.
-	Reflow func(ids []string, work func()) error
+	// Hold keeps the poll off the panes a run touches while it kills or
+	// relaunches them; nil runs the work directly.
+	Hold func(ids []string, work func()) error
 }
 
 // Run carries out a confirmed session action off the event loop.
@@ -109,7 +109,7 @@ func Run(services Services, request Request) (Result, error) {
 		ids = append(ids, sess.ID)
 	}
 	var operationErr error
-	reflowErr := reflow(services, ids, func() {
+	holdErr := hold(services, ids, func() {
 		if services.Watch != nil && (target.Action == Archive || target.Action == Remove || target.Action == Kill || target.Action == Restart) {
 			for _, id := range ids {
 				services.Watch.Unwatch(id)
@@ -179,8 +179,8 @@ func Run(services Services, request Request) (Result, error) {
 			result.Survivor = services.Driver.Exists(request.Watched)
 		}
 	})
-	if reflowErr != nil {
-		return result, reflowErr
+	if holdErr != nil {
+		return result, holdErr
 	}
 	// The notice reads the revived row: the listed copy can predate the
 	// conversation the agent last reported.
@@ -288,12 +288,12 @@ func archivedSessions(sessions []store.Session) []store.Session {
 	return archived
 }
 
-func reflow(services Services, ids []string, work func()) error {
-	if services.Reflow == nil {
+func hold(services Services, ids []string, work func()) error {
+	if services.Hold == nil {
 		work()
 		return nil
 	}
-	return services.Reflow(ids, work)
+	return services.Hold(ids, work)
 }
 
 // Request is one queued session action: the target, the pane size a relaunch
@@ -344,7 +344,7 @@ func RunAfterTurn(services Services, request AfterTurnRequest) (AfterTurnResult,
 	}
 	var ended sessioncmd.EndAfterTurnResult
 	var endErr error
-	reflowErr := reflow(services, ids, func() {
+	holdErr := hold(services, ids, func() {
 		// Stop watching first, so the watcher does not report a kill it asked
 		// for as a lost client.
 		if services.Watch != nil {
@@ -357,8 +357,8 @@ func RunAfterTurn(services Services, request AfterTurnRequest) (AfterTurnResult,
 			result.Lifecycle.Survivor = services.Driver.Exists(request.Watched)
 		}
 	})
-	if reflowErr != nil {
-		return result, reflowErr
+	if holdErr != nil {
+		return result, holdErr
 	}
 	switch ended.Action {
 	case store.AfterTurnArchive:
@@ -416,7 +416,7 @@ func DeadSessionError(st *store.Store, id string) error {
 // attach, all before the terminal is handed over.
 func RunAttach(services Services, request AttachRequest) (AttachResult, error) {
 	result := AttachResult{}
-	err := reflow(services, []string{request.ID}, func() {
+	err := hold(services, []string{request.ID}, func() {
 		exists, probeErr := services.Driver.SessionExists(request.ID)
 		if probeErr != nil {
 			result.Fatal = probeErr

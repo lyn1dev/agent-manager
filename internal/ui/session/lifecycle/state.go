@@ -39,6 +39,9 @@ type State struct {
 	// spawns on the keystroke itself rather than opening a form that would
 	// swallow them.
 	TerminalKeyAt time.Time
+	// Pending is the action queued on each row whose run has not completed,
+	// which the row shows and a repeat press on it is refused by.
+	Pending map[string]Action
 }
 
 // AwaitedRename is the prompt a spawned session carries and the name the
@@ -225,4 +228,45 @@ func sessionGone(sessions []store.Session, id string) bool {
 		}
 	}
 	return true
+}
+
+// MarkPending records the action queued on each row the target holds, from
+// the confirming key until its run completes.
+func (s *State) MarkPending(target Target) {
+	if s.Pending == nil {
+		s.Pending = map[string]Action{}
+	}
+	for _, sess := range target.Sessions {
+		s.Pending[sess.ID] = target.Action
+	}
+}
+
+// ClearPending drops the rows a completed run held, whether it succeeded or
+// failed.
+func (s *State) ClearPending(target Target) {
+	for _, sess := range target.Sessions {
+		delete(s.Pending, sess.ID)
+	}
+}
+
+// AnyPending reports whether an action is still in flight on any of the rows.
+func (s *State) AnyPending(sessions []store.Session) bool {
+	for _, sess := range sessions {
+		if _, pending := s.Pending[sess.ID]; pending {
+			return true
+		}
+	}
+	return false
+}
+
+// PendingWord is what a row with action in flight says it is doing.
+func PendingWord(action Action) string {
+	return map[Action]string{
+		Archive: "archiving",
+		Restore: "restoring",
+		Remove:  "deleting",
+		Kill:    "killing",
+		Restart: "restarting",
+		Revive:  "reviving",
+	}[action]
 }

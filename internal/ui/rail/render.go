@@ -427,8 +427,8 @@ func SessionGlyph(theme Theme, mode presentation.GlyphMode, session Session, sta
 }
 
 func (p palette) sessionGlyph(g presentation.GlyphSet, session Session, startupPhase int) string {
-	if session.Status == "starting" {
-		return lipgloss.NewStyle().Foreground(p.statusColor(session.Status)).
+	if session.Status == "starting" || session.Pending != "" {
+		return lipgloss.NewStyle().Foreground(p.statusColor("starting")).
 			Render(g.StartupFrame(startupPhase))
 	}
 	if session.IsShell && session.Status != "dead" && session.Status != "errored" {
@@ -474,7 +474,11 @@ func (r renderer) renderSession(row treeRow, selected bool, width int, pad, guid
 	if selected {
 		metaStyle = r.palette.muted
 	}
-	meta := lipgloss.NewStyle().Foreground(r.palette.statusColor(session.Status)).Render(presentation.EscapeControlsInline(statusLabel(session.Status))) +
+	state, label := session.Status, statusLabel(session.Status)
+	if session.Pending != "" {
+		state, label = "starting", session.Pending+"…"
+	}
+	meta := lipgloss.NewStyle().Foreground(r.palette.statusColor(state)).Render(presentation.EscapeControlsInline(label)) +
 		metaStyle.Render(" · "+presentation.EscapeControlsInline(session.Tool))
 	if session.AgentSessionID != "" && r.ctx.ComfortableRows {
 		meta += metaStyle.Render(" · " + session.AgentSessionID)
