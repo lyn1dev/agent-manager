@@ -564,8 +564,8 @@ func (m *Model) spawnTakesOver(request uilaunch.Request) bool {
 	switch {
 	case request.Kind == uilaunch.Form && m.formHolds(request.ComposerGen, request.Draft):
 		return true
-	case request.Kind == uilaunch.Quick && m.quickUntouched(request.ComposerGen, request.Submission.ID):
-		return true
+	case request.Kind == uilaunch.Quick && m.quick() != nil:
+		return m.quickUntouched(request.ComposerGen, request.Submission.ID)
 	}
 	return m.listClear()
 }

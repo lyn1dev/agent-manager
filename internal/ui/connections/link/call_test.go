@@ -89,6 +89,9 @@ func TestAFailedCallReportsAndPicksTheHostBackUp(t *testing.T) {
 	if want := []string{failed.Error()}; !equal(root.errs, want) {
 		t.Fatalf("errors = %q, want %q", root.errs, want)
 	}
+	if len(root.restored) != 1 || root.restored[0].ID != call.Submission.ID {
+		t.Fatalf("restored %v, want the refused prompt back on its bar", root.restored)
+	}
 }
 
 func TestASpawnFromTheFormClosesItAndAQuickSpawnLeavesTheBarOpen(t *testing.T) {

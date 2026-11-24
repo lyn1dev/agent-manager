@@ -250,27 +250,23 @@ func (m *Model) queueRemote(request uilink.Call) tea.Cmd {
 	return m.nextEffectCmd()
 }
 
-// remoteRepeat refuses a second enter on the New Session form or a name
-// field whose spawn or rename is still on its way to the host. Each enter on
-// the quick bar is a submission of its own and queues instead.
+// remoteRepeat refuses a second enter on a New Session form or a name field
+// whose spawn or rename is still on its way to the host, as the local lane
+// refuses one. Quick bar prompts and spawns queue instead.
 func (m *Model) remoteRepeat(request uilink.Call) (string, bool) {
-	var refusal string
-	var same func(pending uilink.Call) bool
-	switch {
-	case request.FromForm:
-		refusal = "this spawn is already in progress"
-		same = func(pending uilink.Call) bool { return pending.FromForm }
-	case request.Op == uilink.Rename || request.Op == uilink.RenameGroup:
-		refusal = "this rename is already on its way"
-		same = func(pending uilink.Call) bool { return pending.Op == request.Op }
-	default:
+	refusal, guarded := map[uilink.Op]string{
+		uilink.Spawn:       "this spawn is already in progress",
+		uilink.Rename:      "this rename is already on its way",
+		uilink.RenameGroup: "this rename is already on its way",
+	}[request.Op]
+	if !guarded || request.FromQuick() {
 		return "", false
 	}
 	for _, job := range append([]*uieffects.Job{m.effects.Remote.Active}, m.effects.Remote.Pending...) {
 		if job == nil {
 			continue
 		}
-		if pending, ok := job.Request.(uilink.Call); ok && same(pending) && pending.ComposerGen == request.ComposerGen {
+		if pending, ok := job.Request.(uilink.Call); ok && pending.Op == request.Op && !pending.FromQuick() && pending.ComposerGen == request.ComposerGen {
 			return refusal, true
 		}
 	}

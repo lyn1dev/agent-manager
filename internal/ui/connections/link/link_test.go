@@ -93,6 +93,7 @@ type recorder struct {
 	answered []bool
 	closed   []Asker
 	renamed  []string
+	restored []spawn.Submission
 	errs     []string
 	done     []string
 }
@@ -109,7 +110,9 @@ func (r *recorder) CloseAsker(gen int, asker Asker) { r.closed = append(r.closed
 
 func (r *recorder) CloseRename(gen int, name string) { r.renamed = append(r.renamed, name) }
 
-func (r *recorder) RestoreRefused(int, spawn.Submission) {}
+func (r *recorder) RestoreRefused(_ int, submission spawn.Submission) {
+	r.restored = append(r.restored, submission)
+}
 
 func (r *recorder) ReportErr(text string) { r.errs = append(r.errs, text) }
 
