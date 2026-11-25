@@ -361,6 +361,11 @@ func (p *Runner) step(ctx context.Context) Result {
 		}
 	}
 	trees := sysstat.Trees(livePIDs)
+	ncpu := sysstat.LogicalCPUs()
+	memTotal, _ := sysstat.MemTotalBytes()
+	now := time.Now()
+	elapsed := now.Sub(p.prevTreeAt).Seconds()
+	haveDelta := !p.prevTreeAt.IsZero() && elapsed > 0.05
 	// Where one tmux call reads every pane, the pass reads them all ahead of
 	// the rows, until a send or a delivery: that can take seconds, and a
 	// capture taken before it describes the pane as it was then.
@@ -375,11 +380,6 @@ func (p *Runner) step(ctx context.Context) Result {
 		captured = p.tmux.CapturePanes(liveIDs)
 		histories = p.quoteHistories(ctx, sessions, captured)
 	}
-	ncpu := sysstat.LogicalCPUs()
-	memTotal, _ := sysstat.MemTotalBytes()
-	now := time.Now()
-	elapsed := now.Sub(p.prevTreeAt).Seconds()
-	haveDelta := !p.prevTreeAt.IsZero() && elapsed > 0.05
 	nextTreeCPU := make(map[int]float64, len(livePIDs))
 
 	preview := ""
