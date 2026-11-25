@@ -3,6 +3,8 @@ package sessioncmd
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,6 +41,127 @@ func normalizeMode(mode string) (string, error) {
 		return store.ReservationShared, nil
 	}
 	return "", fmt.Errorf("unknown mode %q; use exclusive or shared", mode)
+}
+
+func (r *runtime) callerDir(caller store.Session) string {
+	if r.driver != nil {
+		if current, err := r.driver.PaneCurrentPath(caller.ID); err == nil {
+			return current
+		}
+	}
+	return caller.Cwd
+}
+
+func resolveReservationPatterns(baseDir string, patterns []string) []string {
+	resolvedBase := resolveBaseDir(baseDir)
+	seen := make(map[string]bool, len(patterns))
+	resolved := make([]string, 0, len(patterns))
+	for _, pattern := range patterns {
+		pattern = resolveReservationPattern(resolvedBase, pattern)
+		if pattern == "" || seen[pattern] {
+			continue
+		}
+		seen[pattern] = true
+		resolved = append(resolved, pattern)
+	}
+	return resolved
+}
+
+func resolveBaseDir(baseDir string) string {
+	baseDir = strings.TrimSpace(baseDir)
+	if baseDir == "" {
+		return ""
+	}
+	return resolveExistingSymlinks(filepath.Clean(expandUserHome(baseDir)))
+}
+
+// resolveReservationPattern anchors a relative path or glob at baseDir and
+// normalizes symlinks on its literal prefix, so a relative claim and an
+// absolute claim to the same file conflict while separate checkouts stay
+// independent.
+func resolveReservationPattern(baseDir, pattern string) string {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return ""
+	}
+	pattern = expandUserHome(pattern)
+	if !filepath.IsAbs(pattern) && baseDir != "" {
+		pattern = filepath.Join(baseDir, pattern)
+	} else {
+		pattern = filepath.Clean(pattern)
+	}
+	prefix, tail := splitGlobPrefix(pattern)
+	if prefix == "" {
+		return pattern
+	}
+	resolved := resolveExistingSymlinks(prefix)
+	if tail == "" {
+		return resolved
+	}
+	return filepath.Join(resolved, tail)
+}
+
+func expandUserHome(path string) string {
+	nativeHome := "~" + string(filepath.Separator)
+	if path != "~" && !strings.HasPrefix(path, "~/") && !strings.HasPrefix(path, nativeHome) {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	return filepath.Join(home, path[2:])
+}
+
+// splitGlobPrefix separates the literal directory prefix of a cleaned path from
+// the first segment containing SQLite GLOB metacharacters (*, ?, [), so symlink
+// resolution touches only literal path segments.
+func splitGlobPrefix(cleaned string) (prefix, tail string) {
+	idx := strings.IndexAny(cleaned, "*?[")
+	if idx < 0 {
+		return cleaned, ""
+	}
+	sep := strings.LastIndexByte(cleaned[:idx], filepath.Separator)
+	if sep < 0 {
+		return "", cleaned
+	}
+	prefix = cleaned[:sep]
+	if prefix == "" || prefix == filepath.VolumeName(cleaned) {
+		prefix = cleaned[:sep+1]
+	}
+	return prefix, cleaned[sep+1:]
+}
+
+// resolveExistingSymlinks resolves symlinks through the deepest existing
+// ancestor of an absolute path, keeping any not-yet-created suffix intact.
+func resolveExistingSymlinks(path string) string {
+	if !filepath.IsAbs(path) {
+		return path
+	}
+	var missing []string
+	cur := path
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if len(missing) == 0 {
+				return resolved
+			}
+			parts := make([]string, 0, len(missing)+1)
+			parts = append(parts, resolved)
+			for i := len(missing) - 1; i >= 0; i-- {
+				parts = append(parts, missing[i])
+			}
+			return filepath.Join(parts...)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return path
+		}
+		missing = append(missing, filepath.Base(cur))
+		cur = parent
+	}
 }
 
 func (r *runtime) reservationInfo(reservation store.Reservation, names map[string]string, sessionID string, now time.Time) Reservation {
@@ -91,9 +214,10 @@ func (s *Sessions) Reserve(sessionID string, patterns []string, mode, note strin
 	if err != nil {
 		return ReserveResult{}, err
 	}
+	resolved := resolveReservationPatterns(runtime.callerDir(caller), cleaned)
 	now := time.Now()
-	reservations := make([]store.Reservation, 0, len(cleaned))
-	for _, pattern := range cleaned {
+	reservations := make([]store.Reservation, 0, len(resolved))
+	for _, pattern := range resolved {
 		reservations = append(reservations, store.Reservation{
 			ID:         uuid.NewString()[:8],
 			SessionID:  caller.ID,
@@ -156,8 +280,9 @@ func (s *Sessions) ReleaseFiles(sessionID string, patterns []string) (int, error
 		runtime.emitReservation(caller, lifecyclehook.ReservationInfo{Action: lifecyclehook.ReservationRelease})
 		return int(released), nil
 	}
+	resolved := resolveReservationPatterns(runtime.callerDir(caller), cleaned)
 	total := int64(0)
-	for _, pattern := range cleaned {
+	for _, pattern := range resolved {
 		released, err := runtime.store.Release(caller.ID, pattern)
 		if err != nil {
 			return int(total), err
