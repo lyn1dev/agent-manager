@@ -488,6 +488,7 @@ func (p *Runner) step(ctx context.Context) Result {
 			if fresh {
 				current, err := p.tmux.CapturePane(sess.ID)
 				pane, readable = current, err == nil
+				delete(histories, sess.ID)
 			}
 			if readable {
 				paneLastLines[sess.ID], panePrompts[sess.ID] = p.rowLines(ctx, sess, pane, panes[sess.ID].Path, histories)

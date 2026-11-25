@@ -18,17 +18,7 @@ import (
 func TestPromptsScrolledOffAreRecoveredFromHistory(t *testing.T) {
 	testenv.SkipPOSIXShell(t)
 	m := buildModel(t)
-	m.cfg.Tools["scrolling-tool"] = config.Tool{
-		Command:        `sh -c 'printf "> prompt in %s\n" "$(basename "$PWD")"; seq 1 60; printf "❯ "; exec cat'`,
-		DefaultStatus:  status.Idle,
-		ActivityCutoff: "(?m)^❯",
-		UserEcho:       "^> ",
-	}
-	engine, err := status.NewEngine(m.cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.poller.engine = engine
+	useScrollingTool(t, m)
 	for _, name := range []string{"first", "second"} {
 		dir := filepath.Join(t.TempDir(), name)
 		if err := os.Mkdir(dir, 0o755); err != nil {
@@ -133,4 +123,54 @@ func TestAMessageWaitsOnALineTypedAfterThePassBegan(t *testing.T) {
 	if queued, _ := m.store.QueuedCount(sess.ID); queued != 1 {
 		t.Fatal("a message was typed on top of a line begun during the pass")
 	}
+}
+
+// A row read again for a delivery reads its history again too, so the prompt
+// it shows is the one above the pane as it is now.
+func TestARowReadAgainReadsItsHistoryAgain(t *testing.T) {
+	testenv.SkipPOSIXShell(t)
+	m := buildModel(t)
+	useScrollingTool(t, m)
+	if err := m.spawnSession("scrolling-tool", "worker", t.TempDir(), "", "", false, false); err != nil {
+		t.Fatal(err)
+	}
+	sess := m.sessionRows()[0]
+	settledPane(t, m, sess.ID, "60", "❯")
+	queueMessage(t, m, sess.ID, "rebase on main")
+
+	prev := followDuringPoll
+	t.Cleanup(func() { followDuringPoll = prev })
+	followDuringPoll = func(p *Runner, row *store.Session, agentAlive, paneGone bool) error {
+		if err := m.tmux.Paste(row.ID, "next\n"); err != nil {
+			return err
+		}
+		settledPane(t, m, row.ID, "120", "❯")
+		return nil
+	}
+
+	result := m.poller.Step()
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	if got, want := result.Snapshot.PanePrompts[sess.ID], "a later prompt"; got != want {
+		t.Fatalf("prompt = %q, want %q read from the history above the pane as it is now", got, want)
+	}
+}
+
+// useScrollingTool defines a tool whose prompt echo has scrolled off the
+// screen by the time its pane settles, and which takes one more turn the
+// same way once a line is typed into it.
+func useScrollingTool(t *testing.T, m *harness) {
+	t.Helper()
+	m.cfg.Tools["scrolling-tool"] = config.Tool{
+		Command:        `sh -c 'printf "> prompt in %s\n" "$(basename "$PWD")"; seq 1 60; printf "❯ "; read turn; printf "> a later prompt\n"; seq 61 120; printf "❯ "; exec cat'`,
+		DefaultStatus:  status.Idle,
+		ActivityCutoff: "(?m)^❯",
+		UserEcho:       "^> ",
+	}
+	engine, err := status.NewEngine(m.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.poller.engine = engine
 }
