@@ -120,6 +120,19 @@ func TestEmptyEnterClosesAfterDebounce(t *testing.T) {
 	}
 }
 
+func TestAltEnterAsksToKeepTheText(t *testing.T) {
+	for _, key := range []struct {
+		msg  tea.KeyMsg
+		keep bool
+	}{{tea.KeyMsg{Type: tea.KeyEnter}, false}, {tea.KeyMsg{Type: tea.KeyEnter, Alt: true}, true}} {
+		h := &fakeHost{prompt: &fakePrompt{text: "ship it"}, selected: true}
+		q := NewBar(h, []string{"claude"}, 0, false)
+		if _, request := q.HandleKey(h, key.msg); !request.Send || request.Text != "ship it" || request.Keep != key.keep {
+			t.Fatalf("%s gave %+v, want a send of the prompt with Keep %t", key.msg, request, key.keep)
+		}
+	}
+}
+
 func TestEnterAfterSendKeepsQuickPromptOpen(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := &fakeHost{prompt: &fakePrompt{text: "ship it"}, selected: true}

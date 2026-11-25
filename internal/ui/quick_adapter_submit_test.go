@@ -60,6 +60,27 @@ func TestQuickAltEnterSendsAndKeepsTheText(t *testing.T) {
 	}
 }
 
+func TestQuickAltEnterRefusalLeavesTheKeptTextOnce(t *testing.T) {
+	t.Parallel()
+	m := buildModel(t)
+	createSession(t, m, "target", t.TempDir(), "")
+	m.selectSessionRow(t, "target")
+	m.openQuickMode()
+	q := m.quick()
+	q.Input.SetValue("run the tests")
+	sent := q.Submission()
+	m.handleQuickKey(tea.KeyMsg{Type: tea.KeyEnter, Alt: true})
+	quickSendRoot{m}.ReturnRefused(uiquicksend.SendRequest{ComposerGen: q.Gen, Submission: sent})
+	if got := q.Input.Value(); got != "run the tests" {
+		t.Fatalf("refused alt+enter send left the bar as %q", got)
+	}
+	q.Input.SetValue("newer")
+	quickSendRoot{m}.ReturnRefused(uiquicksend.SendRequest{ComposerGen: q.Gen, Submission: sent})
+	if got := q.Input.Value(); got != "newer" {
+		t.Fatalf("refused alt+enter send replaced a newer prompt, bar = %q", got)
+	}
+}
+
 func TestQuickEnterAcceptsBurstOnSameBar(t *testing.T) {
 	t.Parallel()
 	m := buildModel(t)
