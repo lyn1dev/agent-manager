@@ -44,124 +44,240 @@ func normalizeMode(mode string) (string, error) {
 }
 
 func (r *runtime) callerDir(caller store.Session) string {
-	if r.driver != nil {
-		if current, err := r.driver.PaneCurrentPath(caller.ID); err == nil {
-			return current
-		}
+	if current, err := r.driver.PaneCurrentPath(caller.ID); err == nil {
+		return current
 	}
 	return caller.Cwd
 }
 
-func resolveReservationPatterns(baseDir string, patterns []string) []string {
-	resolvedBase := resolveBaseDir(baseDir)
+type resolvedPattern struct {
+	pattern     string
+	globPattern string
+}
+
+var sqliteGlobEscaper = strings.NewReplacer(
+	"[", "[[]",
+	"*", "[*]",
+	"?", "[?]",
+)
+
+func escapeSQLiteGlob(literal string) string {
+	return sqliteGlobEscaper.Replace(literal)
+}
+
+func resolveReservationPatternsFromBase(resolvedBase string, patterns []string) ([]resolvedPattern, error) {
 	seen := make(map[string]bool, len(patterns))
-	resolved := make([]string, 0, len(patterns))
+	resolved := make([]resolvedPattern, 0, len(patterns))
 	for _, pattern := range patterns {
-		pattern = resolveReservationPattern(resolvedBase, pattern)
-		if pattern == "" || seen[pattern] {
+		item, err := resolveReservationPattern(resolvedBase, pattern)
+		if err != nil {
+			return nil, err
+		}
+		if seen[item.pattern] {
 			continue
 		}
-		seen[pattern] = true
-		resolved = append(resolved, pattern)
+		seen[item.pattern] = true
+		resolved = append(resolved, item)
 	}
-	return resolved
+	return resolved, nil
 }
 
-func resolveBaseDir(baseDir string) string {
+func resolveBaseDir(baseDir string) (string, error) {
 	baseDir = strings.TrimSpace(baseDir)
-	if baseDir == "" {
-		return ""
+	home, rest, hasHome, err := splitHomePrefix(baseDir)
+	if err != nil {
+		return "", err
 	}
-	return resolveExistingSymlinks(filepath.Clean(expandUserHome(baseDir)))
+	if hasHome {
+		resolvedHome, err := resolveLiteralPath(home)
+		if err != nil {
+			return "", err
+		}
+		return walkLiteralSegments(resolvedHome, nil, splitPathSegments(filepath.FromSlash(rest)))
+	}
+	return resolveLiteralPath(baseDir)
 }
 
-// resolveReservationPattern anchors a relative path or glob at baseDir and
-// normalizes symlinks on its literal prefix, so a relative claim and an
-// absolute claim to the same file conflict while separate checkouts stay
-// independent.
-func resolveReservationPattern(baseDir, pattern string) string {
-	pattern = strings.TrimSpace(pattern)
-	if pattern == "" {
-		return ""
+// resolveReservationPattern anchors a relative path or glob at resolvedBase
+// and resolves symlinks segment-by-segment before collapsing "..", while
+// keeping literal directory metacharacters escaped in globPattern.
+func resolveReservationPattern(resolvedBase, pattern string) (resolvedPattern, error) {
+	home, rest, hasHome, err := splitHomePrefix(pattern)
+	if err != nil {
+		return resolvedPattern{}, err
 	}
-	pattern = expandUserHome(pattern)
-	if !filepath.IsAbs(pattern) && baseDir != "" {
-		pattern = filepath.Join(baseDir, pattern)
-	} else {
-		pattern = filepath.Clean(pattern)
+	if hasHome {
+		resolvedHome, err := resolveLiteralPath(home)
+		if err != nil {
+			return resolvedPattern{}, err
+		}
+		return walkPatternSegments(resolvedHome, nil, splitPathSegments(filepath.FromSlash(rest)))
 	}
-	prefix, tail := splitGlobPrefix(pattern)
-	if prefix == "" {
-		return pattern
+	native := filepath.FromSlash(pattern)
+	if filepath.IsAbs(native) {
+		vol := filepath.VolumeName(native)
+		cur := vol + string(filepath.Separator)
+		return walkPatternSegments(cur, nil, splitPathSegments(native[len(vol):]))
 	}
-	resolved := resolveExistingSymlinks(prefix)
-	if tail == "" {
-		return resolved
-	}
-	return filepath.Join(resolved, tail)
+	return walkPatternSegments(resolvedBase, nil, splitPathSegments(native))
 }
 
-func expandUserHome(path string) string {
+func splitHomePrefix(path string) (home, rest string, hasHome bool, err error) {
 	nativeHome := "~" + string(filepath.Separator)
 	if path != "~" && !strings.HasPrefix(path, "~/") && !strings.HasPrefix(path, nativeHome) {
-		return path
+		return "", path, false, nil
 	}
-	home, err := os.UserHomeDir()
+	home, err = os.UserHomeDir()
 	if err != nil {
-		return path
+		return "", "", true, err
 	}
 	if path == "~" {
-		return home
+		return home, "", true, nil
 	}
-	return filepath.Join(home, path[2:])
+	return home, path[2:], true, nil
 }
 
-// splitGlobPrefix separates the literal directory prefix of a cleaned path from
-// the first segment containing SQLite GLOB metacharacters (*, ?, [), so symlink
-// resolution touches only literal path segments.
-func splitGlobPrefix(cleaned string) (prefix, tail string) {
-	idx := strings.IndexAny(cleaned, "*?[")
-	if idx < 0 {
-		return cleaned, ""
+func resolveLiteralPath(raw string) (string, error) {
+	native := filepath.FromSlash(raw)
+	if !filepath.IsAbs(native) {
+		abs, err := filepath.Abs(native)
+		if err != nil {
+			return "", err
+		}
+		native = abs
 	}
-	sep := strings.LastIndexByte(cleaned[:idx], filepath.Separator)
-	if sep < 0 {
-		return "", cleaned
-	}
-	prefix = cleaned[:sep]
-	if prefix == "" || prefix == filepath.VolumeName(cleaned) {
-		prefix = cleaned[:sep+1]
-	}
-	return prefix, cleaned[sep+1:]
+	vol := filepath.VolumeName(native)
+	cur := vol + string(filepath.Separator)
+	return walkLiteralSegments(cur, nil, splitPathSegments(native[len(vol):]))
 }
 
-// resolveExistingSymlinks resolves symlinks through the deepest existing
-// ancestor of an absolute path, keeping any not-yet-created suffix intact.
-func resolveExistingSymlinks(path string) string {
-	if !filepath.IsAbs(path) {
-		return path
-	}
-	var missing []string
-	cur := path
-	for {
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			if len(missing) == 0 {
-				return resolved
-			}
-			parts := make([]string, 0, len(missing)+1)
-			parts = append(parts, resolved)
-			for i := len(missing) - 1; i >= 0; i-- {
-				parts = append(parts, missing[i])
-			}
-			return filepath.Join(parts...)
+func splitPathSegments(path string) []string {
+	raw := strings.Split(path, string(filepath.Separator))
+	segments := make([]string, 0, len(raw))
+	for _, seg := range raw {
+		if seg == "" || seg == "." {
+			continue
 		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return path
-		}
-		missing = append(missing, filepath.Base(cur))
-		cur = parent
+		segments = append(segments, seg)
 	}
+	return segments
+}
+
+func walkLiteralSegments(cur string, missing []string, segments []string) (string, error) {
+	for _, seg := range segments {
+		if seg == ".." {
+			if len(missing) > 0 {
+				missing = missing[:len(missing)-1]
+			} else {
+				cur = filepath.Dir(cur)
+			}
+			continue
+		}
+		if len(missing) > 0 {
+			missing = append(missing, seg)
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(filepath.Join(cur, seg))
+		if err == nil {
+			cur = resolved
+			continue
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, seg)
+			continue
+		}
+		return "", err
+	}
+	return joinResolvedPath(cur, missing), nil
+}
+
+func walkPatternSegments(cur string, missing []string, segments []string) (resolvedPattern, error) {
+	for i, seg := range segments {
+		if seg == ".." {
+			if len(missing) > 0 {
+				missing = missing[:len(missing)-1]
+			} else {
+				cur = filepath.Dir(cur)
+			}
+			continue
+		}
+		if strings.ContainsAny(seg, "*?[") {
+			// A segment with '[' (e.g. "repo[1]") that exists on disk is a
+			// literal path entry rather than a glob character class.
+			if len(missing) == 0 && !strings.ContainsAny(seg, "*?") {
+				resolved, err := filepath.EvalSymlinks(filepath.Join(cur, seg))
+				if err == nil {
+					cur = resolved
+					continue
+				}
+				if !errors.Is(err, os.ErrNotExist) {
+					return resolvedPattern{}, err
+				}
+			}
+			prefix := joinResolvedPath(cur, missing)
+			tail := filepath.Join(segments[i:]...)
+			return resolvedPattern{
+				pattern:     filepath.Join(prefix, tail),
+				globPattern: filepath.Join(escapeSQLiteGlob(prefix), tail),
+			}, nil
+		}
+		if len(missing) > 0 {
+			missing = append(missing, seg)
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(filepath.Join(cur, seg))
+		if err == nil {
+			cur = resolved
+			continue
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			missing = append(missing, seg)
+			continue
+		}
+		return resolvedPattern{}, err
+	}
+	full := joinResolvedPath(cur, missing)
+	return resolvedPattern{
+		pattern:     full,
+		globPattern: escapeSQLiteGlob(full),
+	}, nil
+}
+
+func joinResolvedPath(cur string, missing []string) string {
+	if len(missing) == 0 {
+		return cur
+	}
+	parts := make([]string, 0, len(missing)+1)
+	parts = append(parts, cur)
+	parts = append(parts, missing...)
+	return filepath.Join(parts...)
+}
+
+func releaseLegacyRelativeMatches(st *store.Store, sessionID, resolvedBase string, patterns []resolvedPattern, now time.Time) (int64, error) {
+	active, err := st.Reservations(now)
+	if err != nil {
+		return 0, err
+	}
+	targets := make(map[string]bool, len(patterns))
+	for _, item := range patterns {
+		targets[item.pattern] = true
+	}
+	total := int64(0)
+	for _, existing := range active {
+		if existing.SessionID != sessionID || filepath.IsAbs(existing.Pattern) {
+			continue
+		}
+		legacy, err := resolveReservationPattern(resolvedBase, existing.Pattern)
+		if err != nil || !targets[legacy.pattern] {
+			continue
+		}
+		released, err := st.Release(sessionID, existing.Pattern)
+		if err != nil {
+			return total, err
+		}
+		total += released
+	}
+	return total, nil
 }
 
 func (r *runtime) reservationInfo(reservation store.Reservation, names map[string]string, sessionID string, now time.Time) Reservation {
@@ -214,24 +330,35 @@ func (s *Sessions) Reserve(sessionID string, patterns []string, mode, note strin
 	if err != nil {
 		return ReserveResult{}, err
 	}
-	resolved := resolveReservationPatterns(runtime.callerDir(caller), cleaned)
+	resolvedBase, err := resolveBaseDir(runtime.callerDir(caller))
+	if err != nil {
+		return ReserveResult{}, err
+	}
+	resolved, err := resolveReservationPatternsFromBase(resolvedBase, cleaned)
+	if err != nil {
+		return ReserveResult{}, err
+	}
 	now := time.Now()
 	reservations := make([]store.Reservation, 0, len(resolved))
-	for _, pattern := range resolved {
+	for _, item := range resolved {
 		reservations = append(reservations, store.Reservation{
-			ID:         uuid.NewString()[:8],
-			SessionID:  caller.ID,
-			Pattern:    pattern,
-			Mode:       mode,
-			Note:       strings.TrimSpace(note),
-			AcquiredAt: now,
-			ExpiresAt:  now.Add(ttl),
+			ID:          uuid.NewString()[:8],
+			SessionID:   caller.ID,
+			Pattern:     item.pattern,
+			GlobPattern: item.globPattern,
+			Mode:        mode,
+			Note:        strings.TrimSpace(note),
+			AcquiredAt:  now,
+			ExpiresAt:   now.Add(ttl),
 		})
 	}
 	// One store call leases the whole set, so a failure grants nothing
 	// rather than leaving leases the caller was never told it holds.
 	clashes, err := runtime.store.Reserve(reservations)
 	if err != nil {
+		return ReserveResult{}, err
+	}
+	if _, err := releaseLegacyRelativeMatches(runtime.store, caller.ID, resolvedBase, resolved, now); err != nil {
 		return ReserveResult{}, err
 	}
 	result := ReserveResult{Reserved: make([]Reservation, 0, len(reservations))}
@@ -280,19 +407,31 @@ func (s *Sessions) ReleaseFiles(sessionID string, patterns []string) (int, error
 		runtime.emitReservation(caller, lifecyclehook.ReservationInfo{Action: lifecyclehook.ReservationRelease})
 		return int(released), nil
 	}
-	resolved := resolveReservationPatterns(runtime.callerDir(caller), cleaned)
+	resolvedBase, err := resolveBaseDir(runtime.callerDir(caller))
+	if err != nil {
+		return 0, err
+	}
+	resolved, err := resolveReservationPatternsFromBase(resolvedBase, cleaned)
+	if err != nil {
+		return 0, err
+	}
 	total := int64(0)
-	for _, pattern := range resolved {
-		released, err := runtime.store.Release(caller.ID, pattern)
+	for _, item := range resolved {
+		released, err := runtime.store.Release(caller.ID, item.pattern)
 		if err != nil {
 			return int(total), err
 		}
 		total += released
 		runtime.emitReservation(caller, lifecyclehook.ReservationInfo{
 			Action:  lifecyclehook.ReservationRelease,
-			Pattern: pattern,
+			Pattern: item.pattern,
 		})
 	}
+	legacyReleased, err := releaseLegacyRelativeMatches(runtime.store, caller.ID, resolvedBase, resolved, time.Now())
+	if err != nil {
+		return int(total), err
+	}
+	total += legacyReleased
 	return int(total), nil
 }
 

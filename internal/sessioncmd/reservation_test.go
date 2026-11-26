@@ -3,6 +3,7 @@ package sessioncmd
 import (
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/YoanWai/agent-manager/internal/lifecyclehook"
 	"github.com/YoanWai/agent-manager/internal/status"
 	"github.com/YoanWai/agent-manager/internal/store"
+	"github.com/YoanWai/agent-manager/internal/tmux"
 	"github.com/google/uuid"
 )
 
@@ -173,6 +175,7 @@ func newReservationHarness(t *testing.T) *reservationHarness {
 		opened: true,
 		runtime: Runtime{
 			Store:  st,
+			Driver: &tmux.Driver{},
 			Events: rec,
 		},
 	}
@@ -206,7 +209,15 @@ func TestRelativeAndAbsolutePathsConflictInSameCheckout(t *testing.T) {
 	third := h.addSession(t, "third", repo)
 
 	absFile := filepath.Join(repo, "dir", "file.md")
-	wantPattern := resolveReservationPattern(resolveBaseDir(repo), absFile)
+	resolvedBase, err := resolveBaseDir(repo)
+	if err != nil {
+		t.Fatalf("resolveBaseDir: %v", err)
+	}
+	wantResolved, err := resolveReservationPattern(resolvedBase, absFile)
+	if err != nil {
+		t.Fatalf("resolveReservationPattern: %v", err)
+	}
+	wantPattern := wantResolved.pattern
 
 	held, err := h.sessions.Reserve(first, []string{"dir/file.md"}, "exclusive", "relative claim", 0)
 	if err != nil {
@@ -362,21 +373,263 @@ func TestReservationsResolveSymlinkedDirectoriesAndGlobs(t *testing.T) {
 }
 
 func TestResolveReservationPatternEdgeCases(t *testing.T) {
-	if got := resolveReservationPattern("", "dir/./file.md"); got != filepath.Clean("dir/file.md") {
-		t.Fatalf("empty baseDir = %q", got)
+	resolvedBase, err := resolveBaseDir(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolveBaseDir: %v", err)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		want := resolveReservationPattern("", filepath.Join(home, "repo", "file.md"))
-		if got := resolveReservationPattern(t.TempDir(), "~/repo/file.md"); got != want {
-			t.Fatalf("tilde path = %q, want %q", got, want)
+		want, err := resolveReservationPattern(resolvedBase, filepath.Join(home, "repo", "file.md"))
+		if err != nil {
+			t.Fatalf("resolve absolute home path: %v", err)
+		}
+		got, err := resolveReservationPattern(resolvedBase, "~/repo/file.md")
+		if err != nil {
+			t.Fatalf("resolve tilde path: %v", err)
+		}
+		if got.pattern != want.pattern {
+			t.Fatalf("tilde path = %q, want %q", got.pattern, want.pattern)
 		}
 	}
-	prefix, tail := splitGlobPrefix(filepath.FromSlash("/repo/dir/*.go"))
-	if prefix != filepath.FromSlash("/repo/dir") || tail != "*.go" {
-		t.Fatalf("splitGlobPrefix = (%q, %q)", prefix, tail)
+	got, err := resolveReservationPattern(resolvedBase, "dir/./file.md")
+	if err != nil {
+		t.Fatalf("resolve relative path: %v", err)
 	}
-	prefix, tail = splitGlobPrefix("*.go")
-	if prefix != "" || tail != "*.go" {
-		t.Fatalf("splitGlobPrefix bare glob = (%q, %q)", prefix, tail)
+	if want := filepath.Join(resolvedBase, "dir", "file.md"); got.pattern != want {
+		t.Fatalf("relative path = %q, want %q", got.pattern, want)
+	}
+}
+
+func TestReservationsResolveSymlinksBeforeParentTraversal(t *testing.T) {
+	h := newReservationHarness(t)
+	root := t.TempDir()
+	checkout := filepath.Join(root, "checkout")
+	sharedSub := filepath.Join(root, "shared", "sub")
+	if err := os.MkdirAll(checkout, 0o755); err != nil {
+		t.Fatalf("mkdir checkout: %v", err)
+	}
+	if err := os.MkdirAll(sharedSub, 0o755); err != nil {
+		t.Fatalf("mkdir shared: %v", err)
+	}
+	link := filepath.Join(checkout, "link")
+	if err := os.Symlink(sharedSub, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	viaLink := h.addSession(t, "via-link", checkout)
+	viaShared := h.addSession(t, "via-shared", filepath.Join(root, "shared"))
+
+	held, err := h.sessions.Reserve(viaLink, []string{"link/../file.md"}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve link/../file.md: %v", err)
+	}
+	resolvedShared, err := resolveBaseDir(filepath.Join(root, "shared"))
+	if err != nil {
+		t.Fatalf("resolve shared: %v", err)
+	}
+	wantPattern := filepath.Join(resolvedShared, "file.md")
+	if len(held.Reserved) != 1 || held.Reserved[0].Pattern != wantPattern {
+		t.Fatalf("reserved = %+v, want %q", held.Reserved, wantPattern)
+	}
+
+	clash, err := h.sessions.Reserve(viaShared, []string{"file.md"}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve shared file.md: %v", err)
+	}
+	if len(clash.Conflicts) != 1 || clash.Conflicts[0].Holder != "via-link" {
+		t.Fatalf("conflicts = %+v, want via-link", clash.Conflicts)
+	}
+
+	// Same behavior for absolute traversal and trailing glob after "..".
+	globClash, err := h.sessions.Reserve(viaLink, []string{filepath.Join(checkout, "link", "..", "*.md")}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve link/../*.md: %v", err)
+	}
+	if len(globClash.Conflicts) != 1 || globClash.Conflicts[0].Holder != "via-shared" {
+		t.Fatalf("glob traversal conflicts = %+v, want via-shared", globClash.Conflicts)
+	}
+}
+
+func TestReservationsMatchWhenDirectoryContainsGlobMetacharacters(t *testing.T) {
+	h := newReservationHarness(t)
+	root := t.TempDir()
+	bracketDir := filepath.Join(root, "repo[1]")
+	plainDir := filepath.Join(root, "repo1")
+	if err := os.MkdirAll(bracketDir, 0o755); err != nil {
+		t.Fatalf("mkdir bracket: %v", err)
+	}
+	if err := os.MkdirAll(plainDir, 0o755); err != nil {
+		t.Fatalf("mkdir plain: %v", err)
+	}
+
+	globSess := h.addSession(t, "glob-holder", bracketDir)
+	fileSess := h.addSession(t, "file-holder", bracketDir)
+	plainSess := h.addSession(t, "plain-holder", plainDir)
+
+	held, err := h.sessions.Reserve(globSess, []string{"*.md"}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve *.md: %v", err)
+	}
+	resolvedBracket, err := resolveBaseDir(bracketDir)
+	if err != nil {
+		t.Fatalf("resolveBaseDir: %v", err)
+	}
+	if want := filepath.Join(resolvedBracket, "*.md"); held.Reserved[0].Pattern != want {
+		t.Fatalf("stored pattern = %q, want %q", held.Reserved[0].Pattern, want)
+	}
+
+	clash, err := h.sessions.Reserve(fileSess, []string{"note.md"}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve note.md: %v", err)
+	}
+	if len(clash.Conflicts) != 1 || clash.Conflicts[0].Holder != "glob-holder" {
+		t.Fatalf("conflicts = %+v, want glob-holder", clash.Conflicts)
+	}
+
+	// Reverse direction: reserving glob after literal file also conflicts.
+	globSess2 := h.addSession(t, "glob-holder-2", bracketDir)
+	reverse, err := h.sessions.Reserve(globSess2, []string{"*.md"}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve *.md second: %v", err)
+	}
+	if len(reverse.Conflicts) != 2 {
+		t.Fatalf("reverse conflicts = %+v, want glob-holder and file-holder", reverse.Conflicts)
+	}
+
+	// Plain repo1 directory must stay isolated from repo[1].
+	unrelated, err := h.sessions.Reserve(plainSess, []string{"note.md"}, "exclusive", "", 0)
+	if err != nil {
+		t.Fatalf("Reserve plain note.md: %v", err)
+	}
+	if len(unrelated.Conflicts) != 0 {
+		t.Fatalf("repo1 falsely conflicted with repo[1]: %+v", unrelated.Conflicts)
+	}
+}
+
+func TestReservationsPropagateHomeExpansionErrors(t *testing.T) {
+	h := newReservationHarness(t)
+	repo := t.TempDir()
+	sess := h.addSession(t, "worker", repo)
+
+	if _, err := h.sessions.Reserve(sess, []string{"existing.md"}, "exclusive", "", 0); err != nil {
+		t.Fatalf("Reserve baseline: %v", err)
+	}
+
+	homeVar := "HOME"
+	if goruntime.GOOS == "windows" {
+		homeVar = "USERPROFILE"
+	}
+	t.Setenv(homeVar, "")
+
+	if _, err := h.sessions.Reserve(sess, []string{"~/repo/file.md"}, "exclusive", "", 0); err == nil {
+		t.Fatalf("Reserve with unset %s unexpectedly succeeded", homeVar)
+	}
+	if _, err := h.sessions.ReleaseFiles(sess, []string{"~/repo/file.md"}); err == nil {
+		t.Fatalf("ReleaseFiles with unset %s unexpectedly succeeded", homeVar)
+	}
+	// Non-tilde paths remain unaffected and existing leases remain intact.
+	if _, err := h.sessions.Reserve(sess, []string{"other.md"}, "exclusive", "", 0); err != nil {
+		t.Fatalf("Reserve non-tilde with unset %s: %v", homeVar, err)
+	}
+	listed, err := h.sessions.Reservations(sess)
+	if err != nil {
+		t.Fatalf("Reservations: %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("listed = %+v, want 2 leases", listed)
+	}
+}
+
+func TestReservationsPropagateSymlinkErrors(t *testing.T) {
+	h := newReservationHarness(t)
+	root := t.TempDir()
+	sess := h.addSession(t, "worker", root)
+
+	loopA := filepath.Join(root, "loop-a")
+	loopB := filepath.Join(root, "loop-b")
+	if err := os.Symlink(loopB, loopA); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(loopA, loopB); err != nil {
+		t.Fatalf("symlink loop-b: %v", err)
+	}
+
+	if _, err := h.sessions.Reserve(sess, []string{"loop-a/file.md"}, "exclusive", "", 0); err == nil {
+		t.Fatalf("Reserve on symlink loop unexpectedly succeeded")
+	}
+	if _, err := h.sessions.ReleaseFiles(sess, []string{"loop-a/file.md"}); err == nil {
+		t.Fatalf("ReleaseFiles on symlink loop unexpectedly succeeded")
+	}
+	listed, err := h.sessions.Reservations(sess)
+	if err != nil {
+		t.Fatalf("Reservations: %v", err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("symlink loop stored lease unexpectedly: %+v", listed)
+	}
+
+	if goruntime.GOOS != "windows" && os.Geteuid() != 0 {
+		locked := filepath.Join(root, "locked")
+		if err := os.MkdirAll(filepath.Join(locked, "sub"), 0o755); err != nil {
+			t.Fatalf("mkdir locked: %v", err)
+		}
+		if err := os.Chmod(locked, 0o000); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+		if _, err := h.sessions.Reserve(sess, []string{"locked/sub/file.md"}, "exclusive", "", 0); err == nil {
+			t.Fatalf("Reserve under unreadable dir unexpectedly succeeded")
+		}
+		if _, err := h.sessions.ReleaseFiles(sess, []string{"locked/sub/file.md"}); err == nil {
+			t.Fatalf("ReleaseFiles under unreadable dir unexpectedly succeeded")
+		}
+	}
+}
+
+func TestReservationsReleaseAndRenewLegacyRelativeLeases(t *testing.T) {
+	h := newReservationHarness(t)
+	repo := t.TempDir()
+	sess := h.addSession(t, "worker", repo)
+
+	now := time.Now()
+	// Seed a legacy active reservation stored with a relative pattern prior to normalization.
+	if _, err := h.store.Reserve([]store.Reservation{{
+		ID:         "legacy01",
+		SessionID:  sess,
+		Pattern:    "dir/file.md",
+		Mode:       store.ReservationExclusive,
+		Note:       "pre-upgrade",
+		AcquiredAt: now,
+		ExpiresAt:  now.Add(time.Hour),
+	}}); err != nil {
+		t.Fatalf("seed legacy reservation: %v", err)
+	}
+
+	// Renewing via resolved or relative spelling supersedes the legacy relative row cleanly.
+	if _, err := h.sessions.Reserve(sess, []string{filepath.Join(repo, "dir", "file.md")}, "shared", "renewed", 0); err != nil {
+		t.Fatalf("Reserve renew legacy: %v", err)
+	}
+	listed, err := h.sessions.Reservations(sess)
+	if err != nil {
+		t.Fatalf("Reservations after renew: %v", err)
+	}
+	if len(listed) != 1 || listed[0].Note != "renewed" || listed[0].Mode != store.ReservationShared || !filepath.IsAbs(listed[0].Pattern) {
+		t.Fatalf("leases after legacy renew = %+v, want one canonical lease", listed)
+	}
+
+	// Seed a second legacy relative lease and verify ReleaseFiles clears it by relative or absolute path.
+	if _, err := h.store.Reserve([]store.Reservation{{
+		ID:         "legacy02",
+		SessionID:  sess,
+		Pattern:    "dir/other.md",
+		Mode:       store.ReservationExclusive,
+		AcquiredAt: now,
+		ExpiresAt:  now.Add(time.Hour),
+	}}); err != nil {
+		t.Fatalf("seed legacy02: %v", err)
+	}
+	released, err := h.sessions.ReleaseFiles(sess, []string{filepath.Join(repo, "dir", "other.md")})
+	if err != nil || released != 1 {
+		t.Fatalf("ReleaseFiles legacy = %d, %v; want 1", released, err)
 	}
 }
